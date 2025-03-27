@@ -284,13 +284,9 @@ def run_transcription_client(config, status_callback):
 
 async def transcription_client(config, status_callback):
     """与转录服务器交互的客户端"""
-    # 连接到OBS WebSocket
-    from obsws_python import obsws, requests  # 修正导入方式
-
-    obs_client = obsws(
-        host=config["obs_host"],
-        port=config["obs_port"],
-        password=config["obs_password"],
+    # 连接到OBS WebSocket，使用原始导入方式
+    obs_client = obs.obsws(
+        config["obs_host"], config["obs_port"], config["obs_password"]
     )
     try:
         obs_client.connect()
@@ -357,9 +353,7 @@ async def transcription_client(config, status_callback):
 
                 # 创建任务处理接收消息
                 receive_task = asyncio.create_task(
-                    handle_messages(
-                        websocket, obs_client, config, status_callback, requests
-                    )
+                    handle_messages(websocket, obs_client, config, status_callback)
                 )
 
                 # 主循环：捕获并发送音频
@@ -439,9 +433,7 @@ async def transcription_client(config, status_callback):
         )
 
 
-async def handle_messages(
-    websocket, obs_client, config, status_callback, requests_module
-):
+async def handle_messages(websocket, obs_client, config, status_callback):
     """处理来自转录服务器的消息"""
     try:
         while True:
@@ -462,7 +454,7 @@ async def handle_messages(
                 # 更新OBS文本源
                 try:
                     obs_client.call(
-                        requests_module.SetInputSettings(  # 使用传入的requests模块
+                        obs.requests.SetInputSettings(  # 使用原始的引用方式
                             inputName=config["text_source"],
                             inputSettings={"text": text},
                         )
