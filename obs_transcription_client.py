@@ -347,6 +347,9 @@ class ConfigGUI:
         self.update_status(f"正在连接转录服务器: {server_url}", is_log=True)
         self.connect_server_button.configure(text="连接中...", state=tk.DISABLED)
 
+        # 重新创建转录任务队列，确保队列是干净的
+        self.transcription_queue = asyncio.Queue(maxsize=1)
+
         # 在后台线程中连接服务器
         def connect_server_thread():
             loop = asyncio.new_event_loop()
@@ -446,6 +449,7 @@ class ConfigGUI:
                     asyncio.run_coroutine_threadsafe(
                         close_websocket(), self.server_websocket_loop
                     )
+                    # 停止事件循环
                     self.server_websocket_loop.stop()
                 else:
                     # 如果loop不在运行，创建一个新的loop来关闭
@@ -459,6 +463,8 @@ class ConfigGUI:
 
             self.server_websocket = None
             self.server_websocket_loop = None
+            # 确保清空任务队列的引用
+            self.transcription_queue = None
 
         self.server_connected = False
         self.connect_server_button.configure(text="连接转录服务器", state=tk.NORMAL)
