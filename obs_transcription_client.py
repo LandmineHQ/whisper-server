@@ -817,37 +817,37 @@ async def transcription_client(
 
             # 发送结束会话请求
             try:
-                # 检查连接是否仍然可用
-                if not websocket.closed:  # 添加检查: 确保WebSocket未关闭
-                    try:
-                        end_message = {"type": "end"}
-                        status_callback.update_status(
-                            f"发送结束会话请求: {json.dumps(end_message)}"
-                        )
-                        await websocket.send(json.dumps(end_message))
-                        # 等待结束确认，但不要因为超时而关闭连接
-                        try:
-                            response = await asyncio.wait_for(
-                                websocket.recv(), timeout=2.0
-                            )
-                            status_callback.update_status(
-                                f"收到会话结束确认: {response}"
-                            )
-                        except asyncio.TimeoutError:
-                            # 超时但不关闭连接
-                            status_callback.update_status(
-                                "等待会话结束确认超时，但保持连接"
-                            )
-                    except websockets.exceptions.ConnectionClosed:
-                        status_callback.update_status(
-                            "无法发送结束请求: WebSocket连接已关闭"
-                        )
-                else:
+                # 使用更可靠的方式检查WebSocket连接状态
+                # 尝试发送结束会话请求，如果失败则捕获异常
+                try:
+                    end_message = {"type": "end"}
                     status_callback.update_status(
-                        "WebSocket连接已关闭，无法发送结束请求"
+                        f"发送结束会话请求: {json.dumps(end_message)}"
+                    )
+
+                    # 尝试发送结束消息
+                    await websocket.send(json.dumps(end_message))
+
+                    # 等待结束确认，但使用try-except捕获可能的超时
+                    try:
+                        response = await asyncio.wait_for(websocket.recv(), timeout=2.0)
+                        status_callback.update_status(f"收到会话结束确认: {response}")
+                    except asyncio.TimeoutError:
+                        # 超时但不关闭连接
+                        status_callback.update_status(
+                            "等待会话结束确认超时，但保持连接"
+                        )
+                except (
+                    websockets.exceptions.ConnectionClosed,
+                    ConnectionResetError,
+                    RuntimeError,  # 捕获更多可能的异常
+                ) as e:
+                    status_callback.update_status(
+                        f"发送结束请求时出错: {str(e)}，但保持连接状态"
                     )
             except Exception as e:
-                status_callback.update_status(f"结束会话错误(保持连接): {str(e)}")
+                # 捕获所有其他异常，但不关闭连接
+                status_callback.update_status(f"结束会话处理错误(保持连接): {str(e)}")
 
     except Exception as e:
         status_callback.update_status(f"转录客户端错误: {str(e)}")
