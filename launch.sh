@@ -1,0 +1,1 @@
+python3 whisper_server.py
