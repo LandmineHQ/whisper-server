@@ -412,6 +412,18 @@ class ConfigGUI:
 
     def disconnect_from_server(self):
         """断开服务器连接状态"""
+        # 先检查是否有正在进行的转录，如果有则先停止
+        if self.transcription_active:
+            self.stop_event.set()  # 立即设置停止信号
+            self.add_log("检测到活动的转录会话，正在停止...")
+            # 直接重置转录状态，因为WebSocket即将关闭
+            self.transcription_active = False
+            self.start_button.configure(text="启动转录", state=tk.DISABLED)
+            # 清理音频资源
+            self.cleanup_audio()
+            # 清除传输统计
+            self.update_stats("")
+
         if self.transcription_task:
             # 取消转录任务处理器
             if self.server_websocket_loop and self.server_websocket_loop.is_running():

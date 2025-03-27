@@ -10,7 +10,7 @@ import uuid
 import time
 import whisper
 import torch
-from queue import Queue
+from queue import Queue, Empty  # 修改这里，导入Empty异常
 from threading import Thread
 import os
 from collections import deque
@@ -48,13 +48,18 @@ class AudioProcessor:
         self.total_duration = 0.0
         self.last_transcript = ""
         self.last_full_transcript = ""
-        self.audio_queue = Queue()
+        self.audio_queue = Queue(maxsize=10)  # 限制队列大小，防止积压
         self.result_queue = Queue()
         self.processing_thread = Thread(target=self._process_audio_thread, daemon=True)
         self.processing_thread.start()
 
-        # 保持一个最近的音频缓冲区，用于连续转录
-        self.audio_history = deque(maxlen=5)  # 约5秒的历史记录
+        # 优化：保持一个最近的音频缓冲区，限制实际秒数而不仅是数量
+        # 计算每秒音频的大致样本数
+        self.samples_per_second = self.sample_rate  # 对于单声道float32音频
+        # 只保留最近2秒的音频作为上下文
+        self.max_history_seconds = 2.0
+        self.audio_history = []
+        self.history_duration = 0.0
 
     def add_audio_chunk(self, audio_data):
         """添加16位PCM音频数据块到缓冲区"""
@@ -67,19 +72,40 @@ class AudioProcessor:
             np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
         )
 
-        # 保存到当前音频块和历史记录
+        # 保存到当前音频块
         self.audio_buffer.append(float_data)
-        self.audio_history.append(float_data)
+
+        # 优化：更新历史音频，使用基于实际秒数的滑动窗口
+        self._update_audio_history(float_data, chunk_duration)
 
         # 如果累积了足够的音频(约1秒)，进行处理
         if self.total_duration >= 1.0:
             # 合并音频数据
             combined_data = np.concatenate(self.audio_buffer)
-            self.audio_queue.put(combined_data)
+
+            # 使用非阻塞方式添加到队列，避免因队列满而阻塞
+            try:
+                self.audio_queue.put_nowait(combined_data)
+            except asyncio.QueueFull:
+                logger.warning("音频处理队列已满，丢弃当前音频块")
 
             # 重置缓冲区
             self.audio_buffer = []
             self.total_duration = 0.0
+
+    def _update_audio_history(self, audio_data, duration):
+        """更新音频历史，保持滑动窗口"""
+        # 添加新音频到历史
+        self.audio_history.append((audio_data, duration))
+        self.history_duration += duration
+
+        # 移除过旧的音频，保持历史不超过最大秒数
+        while (
+            self.history_duration > self.max_history_seconds
+            and len(self.audio_history) > 1
+        ):
+            old_data, old_duration = self.audio_history.pop(0)
+            self.history_duration -= old_duration
 
     def get_latest_result(self):
         """获取最新的转录结果(非阻塞)"""
@@ -96,9 +122,14 @@ class AudioProcessor:
         global whisper_model
 
         while True:
+            got_item = False  # 添加标志，跟踪是否成功获取了队列项目
             try:
-                # 获取下一个音频块
-                audio_data = self.audio_queue.get()
+                # 获取下一个音频块，设置超时防止无限等待
+                try:
+                    audio_data = self.audio_queue.get(timeout=5)
+                    got_item = True  # 标记成功获取项目
+                except Empty:  # 使用正确的Empty异常
+                    continue
 
                 # 如果whisper模型还没加载完成，等待
                 if whisper_model is None:
@@ -113,43 +144,91 @@ class AudioProcessor:
                     self.audio_queue.task_done()
                     continue
 
-                # 准备历史音频记录(可选，用于更好的连续性)
+                # 优化：准备历史音频记录，只使用有限的上下文
                 context_audio = None
-                if len(self.audio_history) > 1:
-                    # 从历史记录重建一段上下文音频
-                    history_items = list(self.audio_history)[:-1]  # 除了最后添加的块
-                    if history_items:
-                        context_audio = np.concatenate(history_items)
+                if self.audio_history:
+                    # 从历史记录中提取音频数据
+                    history_audio_data = [data for data, _ in self.audio_history]
+                    if history_audio_data:
+                        context_audio = np.concatenate(history_audio_data)
+                        # 记录使用的历史音频大小
+                        logger.debug(
+                            f"使用历史音频上下文: {len(context_audio)/self.samples_per_second:.2f}秒"
+                        )
+
+                # 添加超时机制，确保单次转录不会无限消耗时间
+                start_time = time.time()
+                timeout = 5.0  # 5秒超时
 
                 # 将音频发送到Whisper模型
-                with torch.no_grad():
-                    # 优先使用具有上下文的历史音频(如果有)
-                    if context_audio is not None:
-                        input_audio = np.concatenate([context_audio, audio_data])
-                    else:
-                        input_audio = audio_data
+                try:
+                    with torch.no_grad():
+                        # 优先使用有限的上下文音频
+                        if context_audio is not None:
+                            # 使用最近的历史作为上下文
+                            input_audio = np.concatenate([context_audio, audio_data])
+                        else:
+                            input_audio = audio_data
 
-                    # 进行转录
-                    result = whisper_model.transcribe(
-                        input_audio,
-                        language=self.language,
-                        initial_prompt=(
-                            self.last_full_transcript
-                            if self.last_full_transcript
-                            else None
-                        ),
-                        verbose=False,
-                    )
+                        # 检查处理是否超时
+                        if time.time() - start_time > timeout:
+                            logger.warning("音频处理准备阶段已超时")
+                            raise TimeoutError("音频处理准备超时")
 
-                    # 获取文本
-                    transcribed_text = result["text"].strip()
+                        # 进行转录，限制输入音频长度
+                        # 如果输入音频太长，只取最后30秒
+                        max_audio_length = 30 * self.sample_rate  # 30秒的样本数
+                        if len(input_audio) > max_audio_length:
+                            logger.warning(
+                                f"输入音频过长 ({len(input_audio)/self.sample_rate:.1f}秒)，截取最后30秒"
+                            )
+                            input_audio = input_audio[-max_audio_length:]
 
-                    # 发送中间结果
+                        # 进行转录
+                        result = whisper_model.transcribe(
+                            input_audio,
+                            language=self.language,
+                            initial_prompt=(
+                                self.last_full_transcript
+                                if self.last_full_transcript
+                                else None
+                            ),
+                            verbose=False,
+                        )
+
+                        # 获取文本
+                        transcribed_text = result["text"].strip()
+
+                        # 检查处理是否超时
+                        if time.time() - start_time > timeout:
+                            logger.warning("音频转录已超时，但仍完成了处理")
+
+                        # 发送结果
+                        self.result_queue.put(
+                            {
+                                "text": transcribed_text,
+                                "is_final": True,  # 每个音频块我们都当作最终结果
+                                "language": result.get("language", self.language),
+                                "processing_time": time.time() - start_time,
+                            }
+                        )
+
+                except TimeoutError:
+                    logger.error("音频处理超时")
                     self.result_queue.put(
                         {
-                            "text": transcribed_text,
-                            "is_final": True,  # 每个音频块我们都当作最终结果
-                            "language": result.get("language", self.language),
+                            "text": "转录处理超时，请稍后再试",
+                            "is_final": False,
+                            "language": self.language,
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"转录处理错误: {str(e)}")
+                    self.result_queue.put(
+                        {
+                            "text": "转录处理出错，请稍后再试",
+                            "is_final": False,
+                            "language": self.language,
                         }
                     )
 
@@ -158,10 +237,11 @@ class AudioProcessor:
                 logger.error(traceback.format_exc())
 
             finally:
-                self.audio_queue.task_done()
+                # 只有在成功从队列中获取了项目时才标记任务完成
+                if got_item:
+                    self.audio_queue.task_done()
 
 
-# 修改此处：移除 path 参数
 async def handle_websocket(websocket):
     """处理WebSocket连接"""
     client_address = websocket.remote_address
@@ -193,6 +273,7 @@ async def handle_websocket(websocket):
                                     "text": result["text"],
                                     "is_final": result["is_final"],
                                     "language": result["language"],
+                                    "processing_time": result.get("processing_time", 0),
                                 }
                             )
                         )
