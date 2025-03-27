@@ -161,7 +161,8 @@ class AudioProcessor:
                 self.audio_queue.task_done()
 
 
-async def handle_websocket(websocket, path):
+# 修改此处：移除 path 参数
+async def handle_websocket(websocket):
     """处理WebSocket连接"""
     client_address = websocket.remote_address
     logger.info(f"新的连接: {client_address}")
@@ -348,7 +349,8 @@ async def cleanup_inactive_sessions():
 def load_model_in_background():
     """在后台线程加载模型"""
     global whisper_model
-    whisper_model = load_whisper_model("large-v3-turbo")
+    # whisper_model = load_whisper_model("large-v3-turbo")
+    whisper_model = load_whisper_model("tiny")
 
 
 async def main():

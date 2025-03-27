@@ -1,4 +1,4 @@
-# Modified obs_transcription_client.py file
+# pyinstaller --onefile --windowed .\main.py
 
 import asyncio
 import websockets
@@ -11,6 +11,7 @@ from tkinter import ttk, scrolledtext, messagebox
 from datetime import datetime
 import configparser
 import os
+import threading
 
 
 # GUI配置界面
@@ -76,10 +77,27 @@ class ConfigGUI:
         ttk.Label(obs_frame, text="文本源:").grid(
             column=0, row=2, sticky=tk.W, pady=(5, 0)
         )
-        self.text_source = ttk.Entry(obs_frame, width=20)
-        self.text_source.insert(0, "转录文本")
+
+        # 修改：将文本源从Entry改为Combobox
+        self.text_source = ttk.Combobox(obs_frame, width=20, state="disabled")
+        self.text_source.set("转录文本")  # 使用set而不是insert
         self.text_source.grid(
-            column=1, row=2, columnspan=3, sticky=(tk.W, tk.E), padx=5, pady=(5, 0)
+            column=1, row=2, columnspan=2, sticky=(tk.W, tk.E), padx=5, pady=(5, 0)
+        )
+
+        # 添加刷新按钮
+        self.refresh_button = ttk.Button(
+            obs_frame, text="刷新", command=self.update_text_sources, width=6
+        )
+        self.refresh_button.grid(column=3, row=2, sticky=tk.E, padx=5, pady=(5, 0))
+        self.refresh_button.configure(state="disabled")  # 初始状态为禁用
+
+        # 添加OBS连接按钮
+        self.connect_obs_button = ttk.Button(
+            obs_frame, text="连接OBS", command=self.toggle_obs_connection, width=12
+        )
+        self.connect_obs_button.grid(
+            column=0, row=3, columnspan=4, sticky=tk.E, pady=(5, 0)
         )
 
         # 服务器设置
@@ -95,15 +113,28 @@ class ConfigGUI:
         self.server_url.insert(0, "ws://localhost:8765")
         self.server_url.grid(column=1, row=0, sticky=(tk.W, tk.E), padx=5)
 
+        # 添加服务器连接按钮
+        self.connect_server_button = ttk.Button(
+            server_frame,
+            text="连接转录服务器",
+            command=self.toggle_server_connection,
+            width=16,
+        )
+        self.connect_server_button.grid(
+            column=0, row=1, columnspan=2, sticky=tk.E, pady=(5, 0)
+        )
+
         # 启动按钮和状态
         control_frame = ttk.Frame(config_frame)
         control_frame.grid(column=0, row=5, sticky=(tk.W, tk.E), pady=5)
         control_frame.columnconfigure(0, weight=1)  # 确保框架能够正确扩展
 
         self.start_button = ttk.Button(
-            control_frame, text="启动转录", command=self.start_transcription, width=12
+            control_frame, text="启动转录", command=self.toggle_transcription, width=12
         )
         self.start_button.pack(side=tk.RIGHT)
+        # 初始禁用转录按钮，直到OBS和服务器都已连接
+        self.start_button.configure(state=tk.DISABLED)
 
         self.status = ttk.Label(control_frame, text="就绪")
         self.status.pack(side=tk.LEFT)
@@ -126,37 +157,363 @@ class ConfigGUI:
 
         # 添加初始日志
         self.add_log("OBS转录客户端已启动")
-        self.add_log("请配置连接参数后点击「启动转录」")
+        self.add_log("请配置连接参数后分别连接OBS和转录服务器，然后启动转录")
 
         # 尝试加载配置文件
         self.load_config()
 
+        # 连接状态和转录控制变量
+        self.obs_connected = False
+        self.server_connected = False
+        self.server_url_valid = False
+        self.obs_client = None
+        self.transcription_active = False
+        self.stop_event = threading.Event()
+        self.client_thread = None
+        self.audio_stream = None
+        self.pyaudio_instance = None
+
+        # 新增：保存转录服务器WebSocket连接
+        self.server_websocket = None
+        self.server_websocket_loop = None
+
+    def update_text_sources(self):
+        """从OBS获取所有文本GDI+源并更新下拉框"""
+        if not self.obs_client:
+            return
+
+        try:
+            # 获取所有输入源
+            list = self.obs_client.get_input_list()
+
+            # 筛选文本GDI+源
+            text_sources = []
+            for input_item in list.inputs:
+                input_kind = input_item.get("inputKind", "")
+                input_name = input_item.get("inputName", "")
+
+                # 检查是否为文本GDI+源 (text_gdiplus_v3)
+                if input_kind == "text_gdiplus_v3":
+                    text_sources.append(input_name)
+
+            # 更新下拉框
+            self.text_source["values"] = text_sources
+
+            # 如果列表中有项目且当前未选择，则选择第一项
+            if text_sources:
+                current_value = self.text_source.get()
+                if not current_value or current_value not in text_sources:
+                    self.text_source.set(text_sources[0])
+                self.add_log(
+                    f"已更新文本源列表，共找到 {len(text_sources)} 个文本GDI+源"
+                )
+            else:
+                self.add_log("未在OBS中找到任何文本GDI+源，请在OBS中添加一个文本源")
+                messagebox.showinfo(
+                    "未找到文本源",
+                    "未在OBS中找到任何文本GDI+源，请在OBS中添加一个文本源后再试。",
+                )
+
+        except Exception as e:
+            self.add_log(f"获取文本源列表时出错: {str(e)}")
+
+    def check_transcription_button_state(self):
+        """根据OBS和服务器的连接状态更新转录按钮状态"""
+        if self.obs_connected and self.server_connected:
+            self.start_button.configure(state=tk.NORMAL)
+        else:
+            self.start_button.configure(state=tk.DISABLED)
+            # 如果正在转录但某个连接断开，停止转录
+            if self.transcription_active:
+                self.stop_transcription()
+                self.add_log("连接断开，已停止转录")
+
+    def toggle_obs_connection(self):
+        """切换OBS连接状态"""
+        if not self.obs_connected:
+            self.connect_to_obs()
+        else:
+            self.disconnect_from_obs()
+
+    def connect_to_obs(self):
+        """连接到OBS WebSocket"""
+        host = self.obs_host.get()
+        try:
+            port = int(self.obs_port.get())
+        except ValueError:
+            messagebox.showerror("错误", "OBS端口必须是数字")
+            return
+
+        password = self.obs_password.get()
+
+        # 更新状态
+        self.update_status("正在连接OBS...", is_log=True)
+        self.connect_obs_button.configure(text="连接中...", state=tk.DISABLED)
+
+        # 在后台线程中连接OBS，避免UI卡顿
+        def connect_obs_thread():
+            try:
+                self.obs_client = obs.ReqClient(
+                    host=host,
+                    port=port,
+                    password=password,
+                )
+
+                # 连接成功，不再需要验证特定文本源
+                self.root.after(0, self._obs_connected_success)
+
+            except Exception as e:
+                self.root.after(0, lambda: self._obs_connected_failure(str(e)))
+
+        threading.Thread(target=connect_obs_thread, daemon=True).start()
+
+    def _obs_connected_success(self):
+        """OBS连接成功后的UI更新"""
+        self.obs_connected = True
+        self.connect_obs_button.configure(text="断开OBS", state=tk.NORMAL)
+        self.update_status("OBS已连接", is_log=True)
+
+        # 启用文本源下拉框和刷新按钮
+        self.text_source.configure(state="readonly")  # readonly允许选择但不允许直接编辑
+        self.refresh_button.configure(state=tk.NORMAL)
+
+        # 获取并更新文本源列表
+        self.update_text_sources()
+
+        self.check_transcription_button_state()
+
+    def _obs_connected_failure(self, error_msg):
+        """OBS连接失败后的UI更新"""
+        self.obs_connected = False
+        self.connect_obs_button.configure(text="连接OBS", state=tk.NORMAL)
+        self.update_status(f"OBS连接失败: {error_msg}", is_log=True)
+        self.check_transcription_button_state()
+
+    def disconnect_from_obs(self):
+        """断开OBS连接"""
+        if self.obs_client:
+            try:
+                # 添加: 主动断开OBS WebSocket连接
+                # 根据obsws_python库的实现，ReqClient内部维护了一个ws_client对象
+                # 需要调用ws_client的disconnect方法
+                if hasattr(self.obs_client, "ws_client") and self.obs_client.ws_client:
+                    self.obs_client.ws_client.disconnect()
+                elif hasattr(self.obs_client, "disconnect"):
+                    self.obs_client.disconnect()
+
+                self.update_status("已断开OBS WebSocket连接", is_log=True)
+            except Exception as e:
+                self.update_status(f"断开OBS连接时发生错误: {str(e)}", is_log=True)
+
+            self.obs_client = None
+            self.obs_connected = False
+            self.connect_obs_button.configure(text="连接OBS", state=tk.NORMAL)
+
+            # 禁用文本源下拉框和刷新按钮
+            self.text_source.configure(state="disabled")
+            self.refresh_button.configure(state="disabled")
+
+            self.update_status("已断开OBS连接", is_log=True)
+            self.check_transcription_button_state()
+
+    def toggle_server_connection(self):
+        """切换服务器连接状态"""
+        if not self.server_connected:
+            self.connect_to_server()
+        else:
+            self.disconnect_from_server()
+
+    def connect_to_server(self):
+        """连接到转录服务器"""
+        server_url = self.server_url.get()
+        self.update_status(f"正在连接转录服务器: {server_url}", is_log=True)
+        self.connect_server_button.configure(text="连接中...", state=tk.DISABLED)
+
+        # 在后台线程中连接服务器
+        def connect_server_thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                # 修改: 连接到服务器并保持连接
+                websocket = loop.run_until_complete(
+                    websockets.connect(server_url, ping_timeout=5)
+                )
+
+                # 保存websocket连接和loop以便后续使用
+                self.server_websocket = websocket
+                self.server_websocket_loop = loop
+
+                # 通知UI线程连接成功
+                self.root.after(0, self._server_connected_success)
+
+                # 保持event loop运行以处理websocket消息
+                loop.run_forever()
+
+            except Exception as e:
+                self.root.after(0, lambda: self._server_connected_failure(str(e)))
+                if loop.is_running():
+                    loop.stop()
+                loop.close()
+
+        self.server_thread = threading.Thread(target=connect_server_thread, daemon=True)
+        self.server_thread.start()
+
+    def _server_connected_success(self):
+        """服务器验证成功后的UI更新"""
+        self.server_connected = True
+        self.connect_server_button.configure(text="断开服务器", state=tk.NORMAL)
+        self.update_status("转录服务器已连接", is_log=True)
+        self.check_transcription_button_state()
+
+    def _server_connected_failure(self, error_msg):
+        """服务器验证失败后的UI更新"""
+        self.server_connected = False
+        self.connect_server_button.configure(text="连接转录服务器", state=tk.NORMAL)
+        self.update_status(f"服务器连接失败: {error_msg}", is_log=True)
+        self.check_transcription_button_state()
+
+    def disconnect_from_server(self):
+        """断开服务器连接状态"""
+        if self.server_websocket:
+            try:
+                # 创建一个新的event loop来关闭websocket连接
+                async def close_websocket():
+                    await self.server_websocket.close()
+
+                if (
+                    self.server_websocket_loop
+                    and self.server_websocket_loop.is_running()
+                ):
+                    # 在当前loop中安排关闭任务
+                    asyncio.run_coroutine_threadsafe(
+                        close_websocket(), self.server_websocket_loop
+                    )
+                    self.server_websocket_loop.stop()
+                else:
+                    # 如果loop不在运行，创建一个新的loop来关闭
+                    temp_loop = asyncio.new_event_loop()
+                    temp_loop.run_until_complete(close_websocket())
+                    temp_loop.close()
+
+                self.update_status("已关闭WebSocket连接", is_log=True)
+            except Exception as e:
+                self.update_status(f"关闭WebSocket连接时出错: {str(e)}", is_log=True)
+
+            self.server_websocket = None
+            self.server_websocket_loop = None
+
+        self.server_connected = False
+        self.connect_server_button.configure(text="连接转录服务器", state=tk.NORMAL)
+        self.update_status("已断开服务器连接", is_log=True)
+        self.check_transcription_button_state()
+
+    def toggle_transcription(self):
+        """切换转录状态：启动或停止"""
+        if not self.transcription_active:
+            # 当前未转录，启动转录
+            self.start_transcription()
+        else:
+            # 当前正在转录，停止转录
+            self.stop_transcription()
+
+    def stop_transcription(self):
+        """停止转录过程"""
+        if self.transcription_active and self.client_thread is not None:
+            self.update_status("正在停止转录...", is_log=True)
+            # 设置停止信号
+            self.stop_event.set()
+            # 按钮文字暂时变为"正在停止..."
+            self.start_button.configure(text="正在停止...", state="disabled")
+
+            # 客户端线程会在检测到stop_event时自行终止，并调用update_status("ready")
+
     def start_transcription(self):
-        # 保存配置
+        """启动转录过程"""
+        # 确保已经连接到OBS和验证了服务器
+        if not self.obs_connected or not self.server_connected:
+            self.add_log("错误：请先连接OBS和转录服务器")
+            return
+
+        # 配置信息
         config = {
-            "obs_host": self.obs_host.get(),
-            "obs_port": int(self.obs_port.get()),
-            "obs_password": self.obs_password.get(),
             "text_source": self.text_source.get(),
             "server_url": self.server_url.get(),
         }
 
+        # 重置停止事件
+        self.stop_event.clear()
+
         # 更新UI
-        self.start_button.configure(state="disabled")
-        self.update_status("正在启动...", is_log=True)
+        self.start_button.configure(text="停止转录")
+        self.update_status("正在启动转录...", is_log=True)
 
-        # 启动转录客户端
-        self.root.after(100, lambda: self.run_client(config))
+        # 设置转录状态为活跃
+        self.transcription_active = True
 
-    def run_client(self, config):
-        # 创建一个新线程运行异步代码
-        import threading
+        # 初始化音频采集
+        try:
+            self.init_audio()
+            # 启动转录客户端
+            self.client_thread = threading.Thread(
+                target=run_transcription_client,
+                args=(
+                    config,
+                    self.update_status,
+                    self.stop_event,
+                    self.obs_client,
+                    self.audio_stream,
+                    self.pyaudio_instance,
+                    self.server_websocket,  # 传递已存在的websocket连接
+                ),
+            )
+            self.client_thread.daemon = True
+            self.client_thread.start()
+        except Exception as e:
+            self.update_status(f"启动转录失败: {str(e)}", is_log=True)
+            self.transcription_active = False
+            self.start_button.configure(text="启动转录")
 
-        client_thread = threading.Thread(
-            target=run_transcription_client, args=(config, self.update_status)
-        )
-        client_thread.daemon = True
-        client_thread.start()
+    def init_audio(self):
+        """初始化音频采集"""
+        try:
+            p = pyaudio.PyAudio()
+            self.pyaudio_instance = p
+
+            # 获取默认输入设备
+            default_input = p.get_default_input_device_info()["index"]
+            self.add_log(f"使用默认音频输入设备: 设备 #{default_input}")
+
+            # 音频配置
+            sample_rate = 16000
+            channels = 1
+            chunk_size = 1600  # 50ms at 16kHz
+            audio_format = pyaudio.paInt16
+
+            stream = p.open(
+                format=audio_format,
+                channels=channels,
+                rate=sample_rate,
+                input=True,
+                input_device_index=default_input,
+                frames_per_buffer=chunk_size,
+            )
+            self.audio_stream = stream
+            return True
+        except Exception as e:
+            self.add_log(f"音频设备初始化错误: {str(e)}")
+            raise e
+
+    def cleanup_audio(self):
+        """清理音频资源"""
+        if self.audio_stream:
+            if self.audio_stream.is_active():
+                self.audio_stream.stop_stream()
+            self.audio_stream.close()
+            self.audio_stream = None
+
+        if self.pyaudio_instance:
+            self.pyaudio_instance.terminate()
+            self.pyaudio_instance = None
 
     def update_status(self, text, is_log=True):
         """更新状态标签和日志区域"""
@@ -165,9 +522,12 @@ class ConfigGUI:
     def _update_ui(self, text, is_log):
         # 更新状态标签
         if text == "ready":
-            # 特殊情况：重置启动按钮
-            self.start_button.configure(state="normal")
+            # 特殊情况：重置转录状态和按钮
+            self.transcription_active = False
+            self.start_button.configure(text="启动转录", state="normal")
             self.status.configure(text="就绪")
+            # 清理音频资源
+            self.cleanup_audio()
         else:
             self.status.configure(text=text)
 
@@ -222,8 +582,8 @@ class ConfigGUI:
 
             self.obs_password.delete(0, tk.END)
 
-            self.text_source.delete(0, tk.END)
-            self.text_source.insert(0, "转录文本")
+            # 修改：对于Combobox使用set
+            self.text_source.set("转录文本")
 
             # 服务器默认设置
             self.server_url.delete(0, tk.END)
@@ -256,8 +616,8 @@ class ConfigGUI:
                     self.obs_password.insert(0, config["OBS"]["password"])
 
                 if "text_source" in config["OBS"]:
-                    self.text_source.delete(0, tk.END)
-                    self.text_source.insert(0, config["OBS"]["text_source"])
+                    # 修改：对于Combobox使用set而不是insert
+                    self.text_source.set(config["OBS"]["text_source"])
 
             # 加载服务器设置
             if "SERVER" in config and "url" in config["SERVER"]:
@@ -270,171 +630,177 @@ class ConfigGUI:
 
 
 # 转录客户端功能实现
-def run_transcription_client(config, status_callback):
+def run_transcription_client(
+    config,
+    status_callback,
+    stop_event,
+    obs_client,
+    audio_stream,
+    pyaudio_instance,
+    existing_websocket=None,  # 修改: 添加现有websocket参数
+):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
-        loop.run_until_complete(transcription_client(config, status_callback))
+        loop.run_until_complete(
+            transcription_client(
+                config,
+                status_callback,
+                stop_event,
+                obs_client,
+                audio_stream,
+                existing_websocket,
+            )
+        )
     except Exception as e:
         status_callback(f"错误: {str(e)}")
     finally:
         loop.close()
 
 
-async def transcription_client(config, status_callback):
+async def transcription_client(
+    config,
+    status_callback,
+    stop_event,
+    obs_client,
+    audio_stream,
+    existing_websocket=None,
+):
     """与转录服务器交互的客户端"""
-    # 连接到OBS WebSocket - 更新为新的API方式
-    obs_client = obs.ReqClient(
-        host=config["obs_host"],
-        port=config["obs_port"],
-        password=config["obs_password"],
-    )
+    websocket = None
 
     try:
-        # ReqClient 会在初始化时自动连接，无需额外调用connect
-        status_callback("已连接到OBS WebSocket")
-    except Exception as e:
-        status_callback(f"连接OBS失败: {str(e)}")
-        return
+        status_callback("开始转录流程")
 
-    # 设置音频捕获
-    p = pyaudio.PyAudio()
+        # 修改: 使用已存在的websocket连接，如果有的话
+        if existing_websocket:
+            try:
+                # 检查websocket是否仍然可用的更安全方法
+                pong = await asyncio.wait_for(existing_websocket.ping(), timeout=1)
+                await pong  # 等待pong响应
+                websocket = existing_websocket
+                status_callback("使用现有转录服务器连接")
+            except Exception as e:
+                status_callback(f"现有连接已失效，将创建新连接: {str(e)}")
+                existing_websocket = None
 
-    try:
-        # 列出可用的输入设备
-        info = p.get_host_api_info_by_index(0)
-        num_devices = info.get("deviceCount")
-        default_input = p.get_default_input_device_info()["index"]
+        if not websocket:
+            # 仅在需要时创建新连接
+            server_url = config["server_url"]
+            status_callback(f"正在连接到转录服务器: {server_url}")
 
-        status_callback(f"使用默认音频输入设备: 设备 #{default_input}")
+            try:
+                websocket = await websockets.connect(server_url, ping_timeout=10)
+                status_callback("已连接到转录服务器")
+            except Exception as e:
+                status_callback(f"服务器连接失败: {str(e)}")
+                return
 
         # 音频配置
         sample_rate = 16000
         channels = 1
-        chunk_size = 1600  # 调整为更合适的大小(50ms at 16kHz)
-        audio_format = pyaudio.paInt16
+        chunk_size = 1600  # 50ms at 16kHz
 
-        stream = p.open(
-            format=audio_format,
-            channels=channels,
-            rate=sample_rate,
-            input=True,
-            input_device_index=default_input,
-            frames_per_buffer=chunk_size,
+        # 发送初始化消息
+        init_message = {
+            "type": "init",
+            "config": {
+                "language": "zh",
+                "sample_rate": sample_rate,
+                "encoding": "LINEAR16",
+                "channels": channels,
+            },
+        }
+        status_callback(f"发送初始化消息: {json.dumps(init_message)}")
+
+        await websocket.send(json.dumps(init_message))
+
+        # 等待初始化确认
+        response = await websocket.recv()
+        data = json.loads(response)
+        if data.get("type") != "init_ack":
+            status_callback(f"初始化失败: {data}")
+            return
+
+        session_id = data.get("session_id", "unknown")
+        status_callback(f"会话已初始化: {session_id}")
+
+        # 创建任务处理接收消息
+        receive_task = asyncio.create_task(
+            handle_messages(websocket, obs_client, config, status_callback)
         )
 
-        # 连接到转录服务器
+        # 主循环：捕获并发送音频
+        status_callback("开始音频捕获...")
+
+        # 跟踪发送的数据量
+        total_bytes_sent = 0
+        chunks_sent = 0
+        start_time = time.time()
+
         try:
-            status_callback(f"正在连接到转录服务器: {config['server_url']}")
-            async with websockets.connect(config["server_url"]) as websocket:
-                status_callback("已连接到转录服务器")
+            while not stop_event.is_set():  # 检查停止信号
+                audio_chunk = audio_stream.read(chunk_size, exception_on_overflow=False)
 
-                # 发送初始化消息
-                init_message = {
-                    "type": "init",
-                    "config": {
-                        "language": "zh",
-                        "sample_rate": sample_rate,
-                        "encoding": "LINEAR16",
-                        "channels": channels,
-                    },
-                }
-                status_callback(f"发送初始化消息: {json.dumps(init_message)}")
+                # 直接发送音频数据作为二进制帧
+                await websocket.send(audio_chunk)
 
-                await websocket.send(json.dumps(init_message))
+                # 更新统计信息
+                chunks_sent += 1
+                total_bytes_sent += len(audio_chunk)
 
-                # 等待初始化确认
-                response = await websocket.recv()
-                data = json.loads(response)
-                if data.get("type") != "init_ack":
-                    status_callback(f"初始化失败: {data}")
-                    return
+                # 每秒显示一次传输统计
+                elapsed = time.time() - start_time
+                if elapsed >= 5.0:  # 每5秒显示一次统计
+                    kbps = (total_bytes_sent * 8 / 1000) / elapsed
+                    status_callback(
+                        f"音频传输: {chunks_sent}个块, {total_bytes_sent / 1024:.1f}KB, {kbps:.1f}Kbps",
+                        is_log=True,
+                    )
+                    # 重置计数器
+                    start_time = time.time()
+                    chunks_sent = 0
+                    total_bytes_sent = 0
 
-                session_id = data.get("session_id", "unknown")
-                status_callback(f"会话已初始化: {session_id}")
+                # 短暂暂停，避免发送过多数据
+                await asyncio.sleep(0.01)
 
-                # 创建任务处理接收消息
-                receive_task = asyncio.create_task(
-                    handle_messages(websocket, obs_client, config, status_callback)
-                )
+            status_callback("检测到停止信号，正在关闭转录...")
+        except KeyboardInterrupt:
+            status_callback("用户中断，正在关闭...")
+        except Exception as e:
+            status_callback(f"音频捕获错误: {str(e)}")
+        finally:
+            # 清理资源
+            receive_task.cancel()
 
-                # 主循环：捕获并发送音频
-                status_callback("开始音频捕获...")
-
-                # 跟踪发送的数据量
-                total_bytes_sent = 0
-                chunks_sent = 0
-                start_time = time.time()
-
+            # 发送结束会话请求
+            if websocket:
                 try:
-                    while True:
-                        audio_chunk = stream.read(
-                            chunk_size, exception_on_overflow=False
-                        )
-
-                        # 直接发送音频数据作为二进制帧
-                        await websocket.send(audio_chunk)
-
-                        # 更新统计信息
-                        chunks_sent += 1
-                        total_bytes_sent += len(audio_chunk)
-
-                        # 每秒显示一次传输统计
-                        elapsed = time.time() - start_time
-                        if elapsed >= 5.0:  # 每5秒显示一次统计
-                            kbps = (total_bytes_sent * 8 / 1000) / elapsed
-                            status_callback(
-                                f"音频传输: {chunks_sent}个块, {total_bytes_sent/1024:.1f}KB, {kbps:.1f}Kbps",
-                                is_log=True,
-                            )
-                            # 重置计数器
-                            start_time = time.time()
-                            chunks_sent = 0
-                            total_bytes_sent = 0
-
-                        # 短暂暂停，避免发送过多数据
-                        await asyncio.sleep(0.01)
-                except KeyboardInterrupt:
-                    status_callback("用户中断，正在关闭...")
-                except Exception as e:
-                    status_callback(f"音频捕获错误: {str(e)}")
-                finally:
-                    # 清理资源
-                    receive_task.cancel()
-
-                    # 发送结束会话请求
+                    # 检查连接是否仍然可用
                     try:
                         end_message = {"type": "end"}
                         status_callback(f"发送结束会话请求: {json.dumps(end_message)}")
                         await websocket.send(json.dumps(end_message))
-
                         # 等待结束确认
                         response = await asyncio.wait_for(websocket.recv(), timeout=2.0)
                         status_callback(f"收到会话结束确认: {response}")
-                    except Exception as e:
-                        status_callback(f"结束会话错误: {str(e)}")
-                    finally:
-                        stream.stop_stream()
-                        stream.close()
-        except Exception as e:
-            status_callback(f"WebSocket连接错误: {str(e)}")
-    except Exception as e:
-        status_callback(f"音频设备初始化错误: {str(e)}")
-    finally:
-        p.terminate()
-        try:
-            # 不再需要显式调用disconnect，但为了安全起见
-            pass
-            status_callback("已断开OBS连接")
-        except:
-            pass
+                    except (
+                        websockets.exceptions.ConnectionClosed,
+                        ConnectionResetError,
+                    ):
+                        status_callback("WebSocket连接已关闭")
+                except Exception as e:
+                    status_callback(f"结束会话错误: {str(e)}")
 
+    except Exception as e:
+        status_callback(f"转录客户端错误: {str(e)}")
+    finally:
+        # 注意：此处不关闭WebSocket连接，因为我们希望保持连接以便重用
         status_callback("转录服务已停止，可以重新启动")
         # 在UI线程中重新启用启动按钮
-        asyncio.get_event_loop().call_soon_threadsafe(
-            lambda: status_callback("ready", is_log=False)
-        )
+        status_callback("ready", is_log=False)
 
 
 async def handle_messages(websocket, obs_client, config, status_callback):
@@ -455,10 +821,11 @@ async def handle_messages(websocket, obs_client, config, status_callback):
                         f"{'最终' if is_final else '中间'} 转录 [{language}]: {text}"
                     )
 
-                # 更新OBS文本源 - 使用新的API方式
+                # 更新OBS文本源
                 try:
-                    # 使用新的API调用方式，直接传入参数而不是通过调用封装的请求类
-                    obs_client.set_input_settings(config["text_source"], {"text": text})
+                    obs_client.set_input_settings(
+                        config["text_source"], {"text": text}, True
+                    )
                 except Exception as e:
                     status_callback(f"更新OBS失败: {str(e)}")
 
@@ -483,6 +850,16 @@ def main():
 
     # 添加窗口关闭事件处理
     def on_closing():
+        # 如果连接了OBS或转录服务器，先断开
+        if gui.obs_connected:
+            gui.disconnect_from_obs()
+        if gui.server_connected:
+            gui.disconnect_from_server()
+
+        # 如果转录正在运行，先停止它
+        if gui.transcription_active:
+            gui.stop_transcription()
+
         gui.add_log("正在关闭应用程序...")
         root.destroy()
 
