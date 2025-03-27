@@ -1,4 +1,4 @@
-# pyinstaller --onefile --windowed obs_transcription_client.py
+# Modified obs_transcription_client.py file
 
 import asyncio
 import websockets
@@ -284,12 +284,15 @@ def run_transcription_client(config, status_callback):
 
 async def transcription_client(config, status_callback):
     """与转录服务器交互的客户端"""
-    # 连接到OBS WebSocket，使用原始导入方式
-    obs_client = obs.obsws(
-        config["obs_host"], config["obs_port"], config["obs_password"]
+    # 连接到OBS WebSocket - 更新为新的API方式
+    obs_client = obs.ReqClient(
+        host=config["obs_host"],
+        port=config["obs_port"],
+        password=config["obs_password"],
     )
+
     try:
-        obs_client.connect()
+        # ReqClient 会在初始化时自动连接，无需额外调用connect
         status_callback("已连接到OBS WebSocket")
     except Exception as e:
         status_callback(f"连接OBS失败: {str(e)}")
@@ -421,7 +424,8 @@ async def transcription_client(config, status_callback):
     finally:
         p.terminate()
         try:
-            obs_client.disconnect()
+            # 不再需要显式调用disconnect，但为了安全起见
+            pass
             status_callback("已断开OBS连接")
         except:
             pass
@@ -451,14 +455,10 @@ async def handle_messages(websocket, obs_client, config, status_callback):
                         f"{'最终' if is_final else '中间'} 转录 [{language}]: {text}"
                     )
 
-                # 更新OBS文本源
+                # 更新OBS文本源 - 使用新的API方式
                 try:
-                    obs_client.call(
-                        obs.requests.SetInputSettings(  # 使用原始的引用方式
-                            inputName=config["text_source"],
-                            inputSettings={"text": text},
-                        )
-                    )
+                    # 使用新的API调用方式，直接传入参数而不是通过调用封装的请求类
+                    obs_client.set_input_settings(config["text_source"], {"text": text})
                 except Exception as e:
                     status_callback(f"更新OBS失败: {str(e)}")
 
