@@ -509,9 +509,26 @@ class AudioProcessor:
         if not self.whisper_model:
             return
 
-        # 优化：检测是否是空音频或低质量音频
-        if np.max(np.abs(audio_data)) < 0.01 or np.mean(np.abs(audio_data)) < 0.001:
-            logger.debug(f"跳过低质量音频处理，能量过低")
+        # 增强: 进一步验证音频质量
+        if len(audio_data) == 0:
+            logger.debug("跳过空的中间结果音频")
+            return
+
+        audio_stats = {
+            "length": len(audio_data) / self.sample_rate,
+            "mean": np.mean(np.abs(audio_data)),
+            "peak": np.max(np.abs(audio_data)),
+            "non_zero": np.count_nonzero(audio_data) / len(audio_data),
+        }
+
+        # 更严格的音频质量检查
+        if audio_stats["mean"] < 0.001 or audio_stats["peak"] < 0.01:
+            logger.debug(f"跳过低质量中间结果音频，能量过低: {audio_stats}")
+            return
+
+        # 检查是否包含无效值
+        if not np.all(np.isfinite(audio_data)):
+            logger.warning(f"中间结果音频包含无效值(NaN/Inf)，跳过处理")
             return
 
         start_time = time.time()  # 记录处理开始时间
@@ -610,55 +627,31 @@ class AudioProcessor:
             # 记录转录开始时间
             start_time = time.time()
 
-            # 修复：检查是否存在有效的音频块
+            # 【增强】检查是否存在有效的音频块
             if not utterance.audio_chunks:
                 logger.warning(f"语音段 {utterance.id} 没有音频数据，跳过处理")
                 utterance.state = UtteranceState.FAILED
                 self.state = ProcessingState.IDLE
                 return
 
-            # 修复：检查音频质量
-            sample_chunk = utterance.audio_chunks[0]
-            if np.max(np.abs(sample_chunk)) < 0.01:
-                logger.debug(f"语音段 {utterance.id} 音频质量过低，可能是静音")
-                utterance.state = UtteranceState.COMPLETED
-                self.state = ProcessingState.IDLE
-                return
-
-            # 添加安全检查 - 限制最大长度
-            max_safe_duration = 20.0  # 20秒安全上限
-            if utterance.duration > max_safe_duration:
-                logger.warning(
-                    f"语音段 {utterance.id} 过长 ({utterance.duration:.2f}秒)，截断处理"
-                )
-                # 计算保留的音频块数量
-                total_samples = sum(len(chunk) for chunk in utterance.audio_chunks)
-                keep_samples = int(max_safe_duration * self.sample_rate)
-
-                # 重构音频块
-                new_chunks = []
-                collected = 0
-                for chunk in utterance.audio_chunks:
-                    if collected + len(chunk) <= keep_samples:
-                        new_chunks.append(chunk)
-                        collected += len(chunk)
-                    else:
-                        # 部分添加最后一个块
-                        remaining = keep_samples - collected
-                        if remaining > 0:
-                            new_chunks.append(chunk[:remaining])
-                        break
-
-                utterance.audio_chunks = new_chunks
-                utterance.duration = max_safe_duration
-
-            # 修复：验证音频块不为空且包含有效数据
-            filtered_chunks = []
+            # 【增强】过滤掉无效音频块 - 更严格检查
+            valid_chunks = []
             for chunk in utterance.audio_chunks:
-                if len(chunk) > 0:
-                    filtered_chunks.append(chunk)
+                # 检查是否有足够的非零值
+                if len(chunk) > 0 and np.isfinite(chunk).all():
+                    non_zero_ratio = np.count_nonzero(chunk) / len(chunk)
+                    if non_zero_ratio >= 0.01:  # 至少1%的非零值
+                        valid_chunks.append(chunk)
+                    else:
+                        logger.debug(
+                            f"跳过几乎全零的音频块，非零比例: {non_zero_ratio:.4f}"
+                        )
+                else:
+                    logger.debug(
+                        f"跳过无效音频块，长度: {len(chunk) if len(chunk) > 0 else 0}"
+                    )
 
-            if not filtered_chunks:
+            if not valid_chunks:
                 logger.warning(
                     f"语音段 {utterance.id} 过滤后没有有效音频数据，跳过处理"
                 )
@@ -666,13 +659,28 @@ class AudioProcessor:
                 self.state = ProcessingState.IDLE
                 return
 
-            utterance.audio_chunks = filtered_chunks
+            utterance.audio_chunks = valid_chunks
 
             # 合并语音段的所有音频块
             audio_data = np.concatenate(utterance.audio_chunks)
 
-            # 修复：确保音频数据长度足够
-            min_audio_length = 0.1  # 最小音频长度(秒)
+            # 【增强】添加更详细的音频统计
+            audio_stats = {
+                "duration": len(audio_data) / self.sample_rate,
+                "mean": np.mean(np.abs(audio_data)),
+                "peak": np.max(np.abs(audio_data)),
+                "non_zero_ratio": np.count_nonzero(audio_data)
+                / max(1, len(audio_data)),
+            }
+
+            logger.debug(
+                f"语音段 {utterance.id} 音频统计: 时长={audio_stats['duration']:.2f}秒, "
+                f"平均能量={audio_stats['mean']:.6f}, 峰值={audio_stats['peak']:.6f}, "
+                f"非零比例={audio_stats['non_zero_ratio']:.4f}"
+            )
+
+            # 【增强】更严格的音频质量检查
+            min_audio_length = 0.3  # 增加到0.3秒
             min_samples = int(min_audio_length * self.sample_rate)
 
             if len(audio_data) < min_samples:
@@ -682,6 +690,45 @@ class AudioProcessor:
                 utterance.state = UtteranceState.FAILED
                 self.state = ProcessingState.IDLE
                 return
+
+            # 【增强】检查音频能量和有效性
+            if audio_stats["mean"] < 0.001 or audio_stats["peak"] < 0.01:
+                logger.warning(
+                    f"语音段 {utterance.id} 音频能量过低，跳过处理: 平均={audio_stats['mean']:.6f}, 峰值={audio_stats['peak']:.6f}"
+                )
+                utterance.state = UtteranceState.FAILED
+                self.state = ProcessingState.IDLE
+                return
+
+            if audio_stats["non_zero_ratio"] < 0.01:  # 非零值太少
+                logger.warning(
+                    f"语音段 {utterance.id} 有效音频内容不足，非零比例: {audio_stats['non_zero_ratio']:.4f}，跳过处理"
+                )
+                utterance.state = UtteranceState.FAILED
+                self.state = ProcessingState.IDLE
+                return
+
+            # 检查是否有无效值 (NaN, Inf)
+            if not np.all(np.isfinite(audio_data)):
+                logger.warning(f"语音段 {utterance.id} 包含无效值(NaN/Inf)，跳过处理")
+                utterance.state = UtteranceState.FAILED
+                self.state = ProcessingState.IDLE
+                return
+
+            # 【增强】确保音频数据足够长 - Whisper可能需要一定的最小长度
+            min_whisper_duration = 0.5  # Whisper建议的最小音频长度
+            min_whisper_samples = int(min_whisper_duration * self.sample_rate)
+
+            if len(audio_data) < min_whisper_samples:
+                # 对过短音频进行重复延长，确保满足最小长度要求
+                repeats_needed = int(np.ceil(min_whisper_samples / len(audio_data)))
+                logger.info(
+                    f"语音段 {utterance.id} 音频过短，通过重复 {repeats_needed} 次满足最小长度要求"
+                )
+                audio_data = np.tile(audio_data, repeats_needed)[:min_whisper_samples]
+
+            # 【增强】规范化音频数据 - 保险措施
+            audio_data = np.clip(audio_data, -1.0, 1.0)  # 确保在 [-1, 1] 范围内
 
             # 准备Whisper选项
             options = {
@@ -838,10 +885,35 @@ class AudioProcessor:
 
     def _execute_transcription_with_timeout(self, audio_data, options, timeout=5.0):
         """使用超时执行转录，防止长时间阻塞"""
-        # 修复: 添加音频有效性检查
+        # 修复: 添加更严格的音频有效性检查
         if len(audio_data) == 0:
             logger.warning("尝试转录空音频数据，已跳过")
             return None
+
+        # 更全面的音频有效性检查
+        audio_energy = np.mean(np.abs(audio_data))
+        audio_peak = np.max(np.abs(audio_data))
+        non_zero_ratio = np.count_nonzero(audio_data) / len(audio_data)
+
+        # 记录诊断信息
+        logger.debug(
+            f"转录音频特征: 长度={len(audio_data)/self.sample_rate:.3f}秒, 均值={audio_energy:.6f}, "
+            f"峰值={audio_peak:.6f}, 非零比例={non_zero_ratio:.3f}"
+        )
+
+        # 验证音频数据的有效性
+        if audio_peak < 0.005 or non_zero_ratio < 0.01:  # 如果峰值太小或非零值太少
+            logger.warning(
+                f"音频质量不足，峰值={audio_peak:.6f}, 非零比例={non_zero_ratio:.3f}，跳过转录"
+            )
+            return None
+
+        if not np.isfinite(audio_data).all():  # 检查NaN和Inf
+            logger.warning("音频数据包含无效值(NaN或inf)，跳过转录")
+            return None
+
+        # 规范化音频数据保险起见 - 确保没有极端值
+        audio_data = np.clip(audio_data, -1.0, 1.0)  # 限制在[-1,1]范围内
 
         # 优化：根据音频长度动态调整超时
         audio_duration = len(audio_data) / self.sample_rate
