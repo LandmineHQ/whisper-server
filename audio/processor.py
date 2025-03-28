@@ -1,146 +1,29 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import asyncio
-import uuid
 import numpy as np
 import logging
 import time
-import websockets
-import whisper
+import json
+import os
+import traceback
+import psutil
 import torch
 from queue import Queue, Empty
 from threading import Thread, Lock
-from concurrent.futures import ThreadPoolExecutor
-import os
-import traceback
-import webrtcvad
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple
-import psutil
-from enum import Enum
-import json
+from typing import List, Dict, Optional
 
-# 配置日志
+from ..models.data_models import ProcessingState, AudioSegment, TranscriptionResult
+from ..audio.vad import VADProcessor
+
 logger = logging.getLogger("whisper-server")
-# 会话信息存储
-active_sessions = {}
-
-
-# 定义处理状态枚举
-class ProcessingState(Enum):
-    IDLE = "idle"
-    PROCESSING = "processing"
-    ERROR = "error"
-    WAITING_MODEL = "waiting_model"
-
-
-# 音频片段数据类
-@dataclass
-class AudioSegment:
-    data: np.ndarray
-    duration: float
-    timestamp: float = field(default_factory=time.time)
-    contains_speech: bool = True
-
-
-# 转录结果数据类
-@dataclass
-class TranscriptionResult:
-    text: str
-    is_final: bool
-    language: str
-    processing_time: float = 0.0
-    confidence: float = 1.0
-    segments: List[Dict[str, Any]] = field(default_factory=list)
-
-
-# 加载whisper模型
-def load_whisper_model(
-    model_name="large-v3-turbo", device=None, quantize=True, amd_optimization=False
-):
-    """
-    加载并优化Whisper模型
-
-    参数:
-        model_name: 模型名称
-        device: 设备 (None=自动选择, "cpu", "cuda", "mps", "xpu" 等)
-        quantize: 是否量化模型
-        amd_optimization: 是否使用AMD优化
-    """
-    logger.info(f"正在加载 Whisper 模型 {model_name}...")
-
-    # 自动选择最佳设备
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"  # Apple Silicon
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = "xpu"  # Intel XPU
-        else:
-            device = "cpu"
-
-    # 加载基础模型
-    model = whisper.load_model(model_name)
-
-    # 设备特定优化
-    if device == "cuda":
-        model = model.to(device)
-        if quantize:
-            model = model.half()  # FP16量化
-    elif device == "cpu":
-        # CPU优化
-        if amd_optimization:
-            # AMD CPU特定优化
-            try:
-                import torch_directml  # 需要安装: pip install torch-directml
-
-                dml = torch_directml.device()
-                model = model.to(dml)
-                logger.info("已应用AMD DirectML优化")
-            except ImportError:
-                logger.warning("未找到torch_directml，使用标准CPU模式")
-
-                # 尝试使用ONNX Runtime优化
-                try:
-                    import onnxruntime as ort
-
-                    # 检查是否有AMD优化的执行提供程序
-                    providers = ort.get_available_providers()
-                    if "ROCMExecutionProvider" in providers:
-                        logger.info("使用ROCMExecutionProvider进行ONNX优化")
-                        # 这里可以添加ONNX模型转换和优化代码
-                    else:
-                        logger.info(f"可用ONNX提供程序: {providers}")
-                except ImportError:
-                    logger.warning("未找到onnxruntime，使用标准PyTorch")
-
-                # 使用PyTorch内置优化
-                torch.set_num_threads(psutil.cpu_count(logical=True))
-                if hasattr(torch, "set_num_interop_threads"):
-                    torch.set_num_interop_threads(psutil.cpu_count(logical=False))
-    elif device == "xpu":
-        # Intel XPU (如果可用)
-        model = model.to(device)
-    else:
-        model = model.to(device)
-
-    # 模型预热，减少首次推理延迟
-    logger.info("进行模型预热...")
-    dummy_audio = np.zeros(16000, dtype=np.float32)  # 1秒静音
-    with torch.no_grad():
-        model.transcribe(dummy_audio, verbose=False)
-
-    logger.info(f"Whisper 模型 {model_name} 加载完成，使用设备: {device}")
-    return model
-
 
 class AudioProcessor:
     def __init__(
         self,
         sample_rate,
         language,
+        whisper_model=None,
         use_vad=True,
         min_history_seconds=2.0,
         max_history_seconds=10.0,
@@ -154,6 +37,7 @@ class AudioProcessor:
         参数:
             sample_rate: 音频采样率
             language: 转录语言
+            whisper_model: Whisper模型实例
             use_vad: 是否使用语音活动检测
             min_history_seconds: 最小历史记录时长
             max_history_seconds: 最大历史记录时长
@@ -163,16 +47,15 @@ class AudioProcessor:
         """
         self.sample_rate = sample_rate
         self.language = language
+        self.whisper_model = whisper_model
         self.audio_buffer = []
         self.total_duration = 0.0
         self.last_transcript = ""
         self.last_full_transcript = ""
 
-        # 队列和线程池
+        # 队列和线程
         self.audio_queue = Queue(maxsize=20)  # 增加队列大小，提高缓冲能力
         self.result_queue = Queue()
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
-        self.futures = []
         self.processing_lock = Lock()  # 防止并发处理冲突
 
         # 状态管理
@@ -190,11 +73,9 @@ class AudioProcessor:
         # VAD配置
         self.use_vad = use_vad
         if use_vad:
-            self.vad = webrtcvad.Vad(vad_aggressiveness)
-            self.vad_frame_duration = 30  # 毫秒
-            self.vad_frame_size = int(sample_rate * self.vad_frame_duration / 1000)
-            self.vad_window = []  # 保存最近的VAD结果用于平滑
-            self.vad_window_size = 5
+            self.vad_processor = VADProcessor(
+                sample_rate=sample_rate, aggressiveness=vad_aggressiveness
+            )
 
         # 自定义词汇
         self.custom_vocabulary = custom_vocabulary
@@ -240,19 +121,8 @@ class AudioProcessor:
         # 使用VAD检查是否包含语音
         contains_speech = True
         if self.use_vad:
-            contains_speech = self._is_speech(float_data)
-
-            # 更新VAD窗口用于平滑决策
-            self.vad_window.append(contains_speech)
-            if len(self.vad_window) > self.vad_window_size:
-                self.vad_window.pop(0)
-
-            # 平滑VAD决策，减少抖动
-            speech_ratio = sum(self.vad_window) / len(self.vad_window)
-            contains_speech = (
-                speech_ratio > 0.3
-            )  # 如果30%以上帧检测到语音，则认为有语音
-
+            contains_speech = self.vad_processor.process_with_smoothing(float_data)
+            
             if not contains_speech:
                 self.processing_stats["vad_filtered"] += 1
 
@@ -317,6 +187,22 @@ class AudioProcessor:
             self.audio_buffer = []
             self.total_duration = 0.0
 
+    def get_latest_result(self):
+        """获取最新的转录结果(非阻塞)"""
+        if not self.result_queue.empty():
+            result = self.result_queue.get()
+            self.last_transcript = result["text"]
+            if result["is_final"]:
+                self.last_full_transcript = self.last_transcript
+            return result
+        return None
+
+    def set_model(self, model):
+        """设置Whisper模型实例"""
+        self.whisper_model = model
+        
+    # 以下是内部方法
+
     def _preprocess_audio(self, audio_data):
         """音频预处理函数"""
         # 应用简单的噪声门限（低于阈值的信号视为噪声）
@@ -329,34 +215,6 @@ class AudioProcessor:
             return normalized
 
         return audio_data
-
-    def _is_speech(self, audio_data):
-        """检查音频片段是否包含语音"""
-        if not self.use_vad:
-            return True
-
-        # 将float32转回int16以供VAD使用
-        pcm_data = (audio_data * 32768).astype(np.int16).tobytes()
-
-        # 分帧检测语音
-        frames = [
-            pcm_data[i : i + self.vad_frame_size * 2]
-            for i in range(0, len(pcm_data), self.vad_frame_size * 2)
-        ]
-
-        if not frames:
-            return False
-
-        speech_frames = sum(
-            1
-            for frame in frames
-            if len(frame) == self.vad_frame_size * 2
-            and self.vad.is_speech(frame, self.sample_rate)
-        )
-
-        # 如果超过25%的帧包含语音，则认为这段音频含有语音
-        speech_ratio = speech_frames / len(frames) if frames else 0
-        return speech_ratio > 0.25
 
     def _update_audio_history(self, audio_data, duration, contains_speech=True):
         """更新音频历史，保持滑动窗口"""
@@ -371,16 +229,6 @@ class AudioProcessor:
         ):
             old_data, old_duration, _ = self.audio_history.pop(0)
             self.history_duration -= old_duration
-
-    def get_latest_result(self):
-        """获取最新的转录结果(非阻塞)"""
-        if not self.result_queue.empty():
-            result = self.result_queue.get()
-            self.last_transcript = result["text"]
-            if result["is_final"]:
-                self.last_full_transcript = self.last_transcript
-            return result
-        return None
 
     def _adapt_history_size(self, transcription_quality):
         """根据转录质量动态调整历史大小"""
@@ -429,15 +277,66 @@ class AudioProcessor:
         # 添加自定义词汇（如果有）
         if self.custom_vocabulary:
             # 根据Whisper API添加自定义词汇选项
-            # 注意：具体实现可能需要根据Whisper版本调整
             options["vocab"] = self.custom_vocabulary
 
         return options
 
+    def _prepare_audio_context(self):
+        """准备历史音频上下文"""
+        context_audio = None
+
+        # 从历史记录中提取包含语音的音频数据
+        speech_history = [
+            data for data, _, has_speech in self.audio_history if has_speech
+        ]
+
+        if speech_history:
+            context_audio = np.concatenate(speech_history)
+            logger.debug(
+                f"使用历史音频上下文: {len(context_audio)/self.samples_per_second:.2f}秒"
+            )
+
+        return context_audio
+
+    def _prepare_input_audio(self, current_audio, context_audio):
+        """准备输入音频，合并上下文和当前音频"""
+        # 如果有上下文音频，合并它
+        if context_audio is not None:
+            input_audio = np.concatenate([context_audio, current_audio])
+        else:
+            input_audio = current_audio
+
+        # 限制输入音频长度
+        max_audio_length = 30 * self.sample_rate  # 30秒的样本数
+        if len(input_audio) > max_audio_length:
+            logger.warning(
+                f"输入音频过长 ({len(input_audio)/self.sample_rate:.1f}秒)，截取最后30秒"
+            )
+            input_audio = input_audio[-max_audio_length:]
+
+        return input_audio
+
+    def _calculate_confidence(self, result):
+        """计算转录结果的置信度"""
+        # 如果结果包含段级别的置信度分数
+        if "segments" in result and result["segments"]:
+            # 计算所有段的平均置信度
+            confidences = [seg.get("confidence", 1.0) for seg in result["segments"]]
+            return sum(confidences) / len(confidences)
+        return 1.0  # 默认置信度
+
+    def _update_processing_stats(self, processing_time):
+        """更新处理统计信息"""
+        self.processing_stats["processed_chunks"] += 1
+        self.processing_stats["total_processing_time"] += processing_time
+        self.processing_stats["max_processing_time"] = max(
+            self.processing_stats["max_processing_time"], processing_time
+        )
+        if processing_time < self.processing_stats["min_processing_time"]:
+            self.processing_stats["min_processing_time"] = processing_time
+
     def _process_audio_thread(self):
         """后台音频处理线程"""
-        global whisper_model
-
         consecutive_errors = 0
         max_consecutive_errors = 3
         backoff_time = 1.0  # 初始回退时间，秒
@@ -462,7 +361,7 @@ class AudioProcessor:
                     continue
 
                 # 如果whisper模型还没加载完成，等待
-                if whisper_model is None:
+                if self.whisper_model is None:
                     self.state = ProcessingState.WAITING_MODEL
                     self.last_state_change = time.time()
 
@@ -508,7 +407,7 @@ class AudioProcessor:
                         whisper_options = self._prepare_whisper_options()
 
                         # 进行转录
-                        result = whisper_model.transcribe(
+                        result = self.whisper_model.transcribe(
                             input_audio, **whisper_options
                         )
 
@@ -584,60 +483,6 @@ class AudioProcessor:
                 # 只有在成功从队列中获取了项目时才标记任务完成
                 if got_item:
                     self.audio_queue.task_done()
-
-    def _prepare_audio_context(self):
-        """准备历史音频上下文"""
-        context_audio = None
-
-        # 从历史记录中提取包含语音的音频数据
-        speech_history = [
-            data for data, _, has_speech in self.audio_history if has_speech
-        ]
-
-        if speech_history:
-            context_audio = np.concatenate(speech_history)
-            logger.debug(
-                f"使用历史音频上下文: {len(context_audio)/self.samples_per_second:.2f}秒"
-            )
-
-        return context_audio
-
-    def _prepare_input_audio(self, current_audio, context_audio):
-        """准备输入音频，合并上下文和当前音频"""
-        # 如果有上下文音频，合并它
-        if context_audio is not None:
-            input_audio = np.concatenate([context_audio, current_audio])
-        else:
-            input_audio = current_audio
-
-        # 限制输入音频长度
-        max_audio_length = 30 * self.sample_rate  # 30秒的样本数
-        if len(input_audio) > max_audio_length:
-            logger.warning(
-                f"输入音频过长 ({len(input_audio)/self.sample_rate:.1f}秒)，截取最后30秒"
-            )
-            input_audio = input_audio[-max_audio_length:]
-
-        return input_audio
-
-    def _calculate_confidence(self, result):
-        """计算转录结果的置信度"""
-        # 如果结果包含段级别的置信度分数
-        if "segments" in result and result["segments"]:
-            # 计算所有段的平均置信度
-            confidences = [seg.get("confidence", 1.0) for seg in result["segments"]]
-            return sum(confidences) / len(confidences)
-        return 1.0  # 默认置信度
-
-    def _update_processing_stats(self, processing_time):
-        """更新处理统计信息"""
-        self.processing_stats["processed_chunks"] += 1
-        self.processing_stats["total_processing_time"] += processing_time
-        self.processing_stats["max_processing_time"] = max(
-            self.processing_stats["max_processing_time"], processing_time
-        )
-        if processing_time < self.processing_stats["min_processing_time"]:
-            self.processing_stats["min_processing_time"] = processing_time
 
     def _monitoring_thread(self):
         """监控线程，收集系统资源使用情况"""
@@ -750,225 +595,3 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"加载状态失败: {str(e)}")
             return False
-
-
-async def handle_websocket(websocket):
-    """处理WebSocket连接"""
-    client_address = websocket.remote_address
-    logger.info(f"新的连接: {client_address}")
-
-    session_id = None
-    audio_processor = None
-    last_activity = time.time()
-
-    try:
-        async for message in websocket:
-            last_activity = time.time()
-
-            # 检查消息类型 - 是二进制音频数据还是文本控制消息
-            if isinstance(message, bytes) and session_id and audio_processor:
-                # 处理二进制音频数据 - 直接使用，无需解码
-                try:
-                    # 直接将二进制数据添加到处理队列
-                    audio_processor.add_audio_chunk(message)
-
-                    # 检查是否有新的转录结果
-                    result = audio_processor.get_latest_result()
-                    if result:
-                        # 发送转录结果
-                        await websocket.send(
-                            json.dumps(
-                                {
-                                    "type": "transcription",
-                                    "text": result["text"],
-                                    "is_final": result["is_final"],
-                                    "language": result["language"],
-                                    "processing_time": result.get("processing_time", 0),
-                                }
-                            )
-                        )
-                except Exception as e:
-                    logger.error(f"处理音频数据时出错: {str(e)}")
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "code": "audio_processing_error",
-                                "message": f"处理音频数据时出错: {str(e)}",
-                            }
-                        )
-                    )
-
-            elif isinstance(message, str):
-                # 处理控制消息 (JSON)
-                try:
-                    data = json.loads(message)
-                    msg_type = data.get("type")
-
-                    if msg_type == "init":
-                        # 处理初始化请求
-                        session_id = str(uuid.uuid4())
-                        config = data.get("config", {})
-
-                        language = config.get("language", "zh")
-                        sample_rate = config.get("sample_rate", 16000)
-
-                        logger.info(
-                            f"会话初始化: {session_id}, 语言: {language}, 采样率: {sample_rate}"
-                        )
-
-                        # 创建音频处理器
-                        audio_processor = AudioProcessor(sample_rate, language)
-
-                        # 保存会话
-                        active_sessions[session_id] = {
-                            "processor": audio_processor,
-                            "last_activity": last_activity,
-                            "config": config,
-                        }
-
-                        # 响应初始化确认
-                        await websocket.send(
-                            json.dumps(
-                                {
-                                    "type": "init_ack",
-                                    "session_id": session_id,
-                                    "status": "ready",
-                                }
-                            )
-                        )
-
-                    elif msg_type == "end" and session_id:
-                        # 结束会话
-                        logger.info(f"会话结束: {session_id}")
-                        if session_id in active_sessions:
-                            del active_sessions[session_id]
-
-                        await websocket.send(
-                            json.dumps({"type": "end_ack", "session_id": session_id})
-                        )
-                        break
-
-                    else:
-                        # 未知消息类型或会话未初始化
-                        await websocket.send(
-                            json.dumps(
-                                {
-                                    "type": "error",
-                                    "code": "invalid_request",
-                                    "message": "无效的请求或会话未初始化",
-                                }
-                            )
-                        )
-
-                except json.JSONDecodeError:
-                    logger.error("JSON解析错误")
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "code": "json_parse_error",
-                                "message": "无法解析JSON消息",
-                            }
-                        )
-                    )
-
-                except Exception as e:
-                    logger.error(f"处理消息时出错: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "code": "server_error",
-                                "message": f"服务器处理错误: {str(e)}",
-                            }
-                        )
-                    )
-
-            else:
-                # 未知消息格式
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "error",
-                            "code": "invalid_message_format",
-                            "message": "无效的消息格式",
-                        }
-                    )
-                )
-
-    except websockets.exceptions.ConnectionClosed as e:
-        logger.info(f"连接关闭: {client_address}, code: {e.code}, reason: {e.reason}")
-
-    except Exception as e:
-        logger.error(f"未处理的异常: {str(e)}")
-        logger.error(traceback.format_exc())
-
-    finally:
-        # 清理会话
-        if session_id and session_id in active_sessions:
-            del active_sessions[session_id]
-        logger.info(f"连接结束: {client_address}")
-
-
-async def cleanup_inactive_sessions():
-    """定期清理不活跃的会话"""
-    while True:
-        try:
-            current_time = time.time()
-            inactive_sessions = []
-
-            # 查找超过5分钟不活跃的会话
-            for session_id, session_data in active_sessions.items():
-                if current_time - session_data["last_activity"] > 300:  # 5分钟
-                    inactive_sessions.append(session_id)
-
-            # 删除不活跃会话
-            for session_id in inactive_sessions:
-                logger.info(f"清理不活跃会话: {session_id}")
-                del active_sessions[session_id]
-
-        except Exception as e:
-            logger.error(f"清理会话时出错: {str(e)}")
-
-        finally:
-            # 每60秒检查一次
-            await asyncio.sleep(60)
-
-
-def load_model_in_background():
-    """在后台线程加载模型"""
-    global whisper_model
-    # whisper_model = load_whisper_model("large-v3-turbo")
-    whisper_model = load_whisper_model("tiny")
-
-
-async def main():
-    # 启动模型加载线程
-    model_thread = Thread(target=load_model_in_background, daemon=True)
-    model_thread.start()
-
-    # 启动WebSocket服务器
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", 8765))
-
-    logger.info(f"启动WebSocket服务器: {host}:{port}")
-
-    # 创建cleanup任务
-    cleanup_task = asyncio.create_task(cleanup_inactive_sessions())
-
-    # 启动WebSocket服务器
-    async with websockets.serve(handle_websocket, host, port):
-        await asyncio.Future()  # 无限运行
-
-
-if __name__ == "__main__":
-    logger.info("启动Whisper WebSocket转录服务器...")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("检测到中断信号，程序退出")
-    except Exception as e:
-        logger.error(f"程序错误: {str(e)}")
-        logger.error(traceback.format_exc())
