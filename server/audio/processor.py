@@ -375,13 +375,11 @@ class AudioProcessor:
                             "confidence": 1.0,
                         }
                     )
-                    self.audio_queue.task_done()
                     continue
 
                 # 如果该段不包含语音且我们使用VAD，则跳过处理
                 if self.use_vad and not segment.contains_speech:
                     logger.debug("跳过不包含语音的音频段")
-                    self.audio_queue.task_done()
                     continue
 
                 # 准备历史音频上下文
