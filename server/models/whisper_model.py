@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import warnings
 import torch
 import whisper
 import numpy as np
@@ -8,6 +9,12 @@ import psutil
 import logging
 
 logger = logging.getLogger("whisper-server")
+
+# 忽略警告
+warnings.filterwarnings(
+    "ignore", "You are using `torch.load` with `weights_only=False`"
+)
+
 
 # 加载whisper模型
 def load_whisper_model(
