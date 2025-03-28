@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# pyinstaller --onefile --windowed .\main.py
+# pyinstaller --onefile --windowed .\client.py
 
 
 def check_dependencies():
