@@ -35,7 +35,7 @@ class ConfigGUI:
 
         # ===== 配置区域 =====
         config_frame = ttk.Frame(main_frame)
-        config_frame.pack(fill=tk.X, expand=False, pady=(0, 10))
+        config_frame.pack(fill=tk.X, expand=False, side=tk.TOP, pady=(0, 10))
 
         # 右上角按钮区域
         buttons_frame = ttk.Frame(config_frame)
@@ -144,6 +144,18 @@ class ConfigGUI:
         obs_frame.columnconfigure(3, weight=1)
         server_frame.columnconfigure(1, weight=1)
 
+        # ===== 状态栏区域 =====
+        self.stats_frame = ttk.Frame(main_frame, padding="5")
+        self.stats_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        # 左侧显示普通状态
+        self.status = ttk.Label(self.stats_frame, text="就绪")
+        self.status.pack(side=tk.LEFT)
+
+        # 右侧显示传输统计
+        self.stats_label = ttk.Label(self.stats_frame, text="")
+        self.stats_label.pack(side=tk.RIGHT)
+
         # ===== 日志区域 =====
         log_frame = ttk.LabelFrame(main_frame, text="运行日志", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True)
@@ -154,18 +166,6 @@ class ConfigGUI:
         )
         self.log_area.pack(fill=tk.BOTH, expand=True)
         self.log_area.config(state=tk.DISABLED)  # 设为只读
-
-        # ===== 状态栏区域 =====
-        self.stats_frame = ttk.Frame(main_frame, padding="5")
-        self.stats_frame.pack(fill=tk.X, expand=False, pady=(5, 0))
-
-        # 左侧显示普通状态
-        self.status = ttk.Label(self.stats_frame, text="就绪")
-        self.status.pack(side=tk.LEFT)
-
-        # 右侧显示传输统计
-        self.stats_label = ttk.Label(self.stats_frame, text="")
-        self.stats_label.pack(side=tk.RIGHT)
 
         # 初始化日志管理器
         self.logger = Logger(self.log_area)
