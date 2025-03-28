@@ -74,7 +74,7 @@ The system consists of two main components:
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/yourusername/whisper-server.git
+   git clone https://github.com/LandmineHQ/whisper-server.git
    cd whisper-server
    ```
 

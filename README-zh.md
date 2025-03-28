@@ -74,7 +74,7 @@
 1. 克隆仓库:
 
    ```bash
-   git clone https://github.com/yourusername/whisper-server.git
+   git clone https://github.com/LandmineHQ/whisper-server.git
    cd whisper-server
    ```
 
