@@ -9,12 +9,12 @@ import time
 import websockets
 import traceback
 
-from ..audio.processor import AudioProcessor
-from .session import (
-    active_sessions, 
-    update_session_activity, 
-    create_session, 
-    remove_session
+from audio.processor import AudioProcessor
+from websocket.session import (
+    active_sessions,
+    update_session_activity,
+    create_session,
+    remove_session,
 )
 
 logger = logging.getLogger("whisper-server")
@@ -22,10 +22,12 @@ logger = logging.getLogger("whisper-server")
 # 全局变量
 whisper_model = None
 
+
 def set_whisper_model(model):
     """设置全局Whisper模型"""
     global whisper_model
     whisper_model = model
+
 
 async def handle_websocket(websocket):
     """处理WebSocket连接"""
@@ -94,17 +96,11 @@ async def handle_websocket(websocket):
 
                         # 创建音频处理器
                         audio_processor = AudioProcessor(
-                            sample_rate, 
-                            language,
-                            whisper_model=whisper_model
+                            sample_rate, language, whisper_model=whisper_model
                         )
 
                         # 保存会话
-                        create_session(
-                            session_id, 
-                            audio_processor, 
-                            config
-                        )
+                        create_session(session_id, audio_processor, config)
 
                         # 响应初始化确认
                         await websocket.send(

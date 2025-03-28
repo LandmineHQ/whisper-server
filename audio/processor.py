@@ -13,10 +13,11 @@ from queue import Queue, Empty
 from threading import Thread, Lock
 from typing import List, Dict, Optional
 
-from ..models.data_models import ProcessingState, AudioSegment, TranscriptionResult
-from ..audio.vad import VADProcessor
+from models.data_models import ProcessingState, AudioSegment, TranscriptionResult
+from audio.vad import VADProcessor
 
 logger = logging.getLogger("whisper-server")
+
 
 class AudioProcessor:
     def __init__(
@@ -122,7 +123,7 @@ class AudioProcessor:
         contains_speech = True
         if self.use_vad:
             contains_speech = self.vad_processor.process_with_smoothing(float_data)
-            
+
             if not contains_speech:
                 self.processing_stats["vad_filtered"] += 1
 
@@ -200,7 +201,7 @@ class AudioProcessor:
     def set_model(self, model):
         """设置Whisper模型实例"""
         self.whisper_model = model
-        
+
     # 以下是内部方法
 
     def _preprocess_audio(self, audio_data):
