@@ -16,7 +16,7 @@ class ConfigGUI:
     def __init__(self, root):
         self.root = root
         root.title("OBS转录客户端")
-        root.geometry("600x500")  # 增加窗口尺寸以容纳日志区域
+        root.geometry("600x650")  # 增加窗口尺寸以容纳日志区域
 
         # 初始化管理器
         self.obs_manager = OBSManager()
