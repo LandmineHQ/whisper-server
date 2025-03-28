@@ -13,7 +13,6 @@ import torch
 from queue import Queue, Empty  # 修改这里，导入Empty异常
 from threading import Thread
 import os
-from collections import deque
 import traceback
 
 # 配置日志
