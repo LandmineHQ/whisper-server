@@ -67,14 +67,25 @@ class ServerConnection:
                 # 标记任务完成
                 self.transcription_queue.task_done()
 
+    # 添加缺失的方法
+    async def _cancel_transcription_task(self):
+        """取消正在进行的转录任务"""
+        if self.transcription_task and not self.transcription_task.done():
+            self.transcription_task.cancel()
+            try:
+                await self.transcription_task
+            except asyncio.CancelledError:
+                pass  # 正常取消，忽略错误
+
     def add_transcription_task(self, task_func, *args):
         """添加转录任务到队列"""
         if self.server_websocket_loop and self.server_websocket:
             asyncio.run_coroutine_threadsafe(
-                self.transcription_queue.put((task_func, *args)),
-                self.server_websocket_loop,
+            self.transcription_queue.put((task_func, *args)),
+            self.server_websocket_loop,
             )
             return True
+
         return False
 
     def disconnect_from_server(self):
@@ -82,11 +93,10 @@ class ServerConnection:
         if self.transcription_task:
             # 取消转录任务处理器
             if self.server_websocket_loop and self.server_websocket_loop.is_running():
-                asyncio.run_coroutine_threadsafe(
+                    asyncio.run_coroutine_threadsafe(
                     self._cancel_transcription_task(), self.server_websocket_loop
-                )
+                    )
             self.transcription_task = None
-
         if self.server_websocket:
             try:
                 # 创建一个新的event loop来关闭websocket连接

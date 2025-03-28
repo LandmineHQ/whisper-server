@@ -350,6 +350,11 @@ class ConfigGUI:
             # 清除传输统计
             self.update_stats("")
 
+        # 检查是否连接了转录服务器
+        if not self.server_connection.server_connected:
+            self.update_status("服务器未连接，无需断开", is_log=True)
+            return
+
         # 断开服务器连接
         success, error = self.server_connection.disconnect_from_server()
         if not success:
